@@ -25,8 +25,8 @@ from src.LLaVA.llava.model.language_model.llava_mpt import LlavaMPTForCausalLM
 from src.LLaVA.llava.constants import DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
 
-def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", device="cuda"):
-    kwargs = {"device_map": device_map}
+def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", device="cuda", **kwargs):
+    kwargs = {"device_map": device_map, **kwargs}
 
     if device != "cuda":
         kwargs['device_map'] = {"": device}
