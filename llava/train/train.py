@@ -34,6 +34,10 @@ from llava import conversation as conversation_lib
 from llava.model import *
 from llava.mm_utils import tokenizer_image_token
 
+from src.data.components.clevr import CLEVR
+from src.data.components.image_reference_game import ImageReferenceGameDataset
+from src.models.components.deterministic_model import DeterministicModel
+
 from PIL import Image
 
 
@@ -43,6 +47,35 @@ local_rank = None
 def rank0_print(*args):
     if local_rank == 0:
         print(*args)
+
+
+# TODO: remove duplicate code and refactor into utils
+def concatenate_images_bar(
+    img1: Image.Image, img2: Image.Image, bar_width: int = 50
+) -> Image.Image:
+    # Get the sizes of the images
+    width1, height1 = img1.size
+    width2, height2 = img2.size
+
+    # Calculate the new height for both images to maintain aspect ratio
+    new_height = max(height1, height2)
+    new_width1 = int((width1 * new_height) / height1)
+    new_width2 = int((width2 * new_height) / height2)
+
+    # Resize the images
+    img1 = img1.resize((new_width1, new_height), Image.BICUBIC)
+    img2 = img2.resize((new_width2, new_height), Image.BICUBIC)
+
+    # Create a white bar
+    white_bar = Image.new("RGB", (bar_width, new_height), (255, 255, 255))
+
+    # Concatenate the images with the white bar
+    result = Image.new("RGB", (new_width1 + 50 + new_width2, new_height))
+    result.paste(img1, (0, 0))
+    result.paste(white_bar, (new_width1, 0))
+    result.paste(img2, (new_width1 + 50, 0))
+
+    return result
 
 
 @dataclass
@@ -630,43 +663,65 @@ class LazySupervisedDataset(Dataset):
                  tokenizer: transformers.PreTrainedTokenizer,
                  data_args: DataArguments):
         super(LazySupervisedDataset, self).__init__()
-        list_data_dict = json.load(open(data_path, "r"))
+
+        deterministic_model = DeterministicModel(
+            output_template="The image contains {raw_output}.",
+            attributes=["color", "shape", "material", "size"],
+            contrastive=True,
+            num_sampled_objects=[1,3],
+            num_sampled_attributes=[1,3],
+        )
+
+        dataset = CLEVR(split="train")
+        self.dataset = ImageReferenceGameDataset(dataset, True, deterministic_model=deterministic_model)
 
         rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
-        self.list_data_dict = list_data_dict
         self.data_args = data_args
 
     def __len__(self):
-        return len(self.list_data_dict)
+        return len(self.dataset)
 
     @property
     def lengths(self):
-        length_list = []
-        for sample in self.list_data_dict:
-            img_tokens = 128 if 'image' in sample else 0
-            length_list.append(sum(len(conv['value'].split()) for conv in sample['conversations']) + img_tokens)
+        # approximation because we don't have fixed lengths
+        length_list = [128+64] * len(self)
         return length_list
 
     @property
     def modality_lengths(self):
-        length_list = []
-        for sample in self.list_data_dict:
-            cur_len = sum(len(conv['value'].split()) for conv in sample['conversations'])
-            cur_len = cur_len if 'images' in sample else -cur_len
-            length_list.append(cur_len)
+        # approximation because we don't have fixed lengths
+        length_list = [64] * len(self)
         return length_list
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
-        sources = self.list_data_dict[i]
+        data = self.dataset[i]
+
+        correct_class = 'left' if data['correct_class'] == 'A' else 'right'
+        incorrect_class = 'right' if data['correct_class'] == 'A' else 'left'
+
+        sources_orig = {
+            'id': data['index'],
+            'image': data['path'],
+            'conversations': [
+                {'from': 'human', 'value': f"<image>\nWrite a description for the {correct_class} image, such that it can be differentiated from the {incorrect_class} image, but do not talk about the {incorrect_class} image. Do not name which image you are describing."},
+                {'from': 'gpt', 'value': data['deterministic_caption']}
+            ]
+        }
+
+        sources = sources_orig
+
+        image = concatenate_images_bar(*data['few_shot_images']).convert('RGB')
+
+        #llava: "Write a description for the {correct_class} image, such that it can be differentiated from the {incorrect_class} image, but do not talk about the {incorrect_class} image. Do not name which image you are describing. Left image: {few_shot_image_0}. Right image: {few_shot_image_1}."
         if isinstance(i, int):
             sources = [sources]
         assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
         if 'image' in sources[0]:
-            image_file = self.list_data_dict[i]['image']
-            image_folder = self.data_args.image_folder
+            #image_file = sources[0]['image']
+            #image_folder = self.data_args.image_folder
             processor = self.data_args.image_processor
-            image = Image.open(os.path.join(image_folder, image_file)).convert('RGB')
+            #image = Image.open(os.path.join(image_folder, image_file)).convert('RGB')
             if self.data_args.image_aspect_ratio == 'pad':
                 def expand2square(pil_img, background_color):
                     width, height = pil_img.size
@@ -692,13 +747,13 @@ class LazySupervisedDataset(Dataset):
         data_dict = preprocess(
             sources,
             self.tokenizer,
-            has_image=('image' in self.list_data_dict[i]))
+            has_image=('image' in sources_orig))
         if isinstance(i, int):
             data_dict = dict(input_ids=data_dict["input_ids"][0],
                              labels=data_dict["labels"][0])
 
         # image exist in the data
-        if 'image' in self.list_data_dict[i]:
+        if 'image' in sources_orig:
             data_dict['images'] = image
         elif self.data_args.is_multimodal:
             # image does not exist in the data, but the model is multimodal
@@ -876,7 +931,7 @@ def train():
             model_args=model_args,
             fsdp=training_args.fsdp
         )
-        
+
         vision_tower = model.get_vision_tower()
         vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
 
