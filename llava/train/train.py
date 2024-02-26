@@ -25,6 +25,7 @@ from typing import Dict, Optional, Sequence, List
 import torch
 
 import transformers
+import tokenizers
 
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 from torch.utils.data import Dataset
@@ -48,6 +49,8 @@ def rank0_print(*args):
     if local_rank == 0:
         print(*args)
 
+from packaging import version
+IS_TOKENIZER_GREATER_THAN_0_14 = version.parse(tokenizers.__version__) >= version.parse('0.14')
 
 # TODO: remove duplicate code and refactor into utils
 def concatenate_images_bar(
@@ -90,6 +93,7 @@ class ModelArguments:
     mm_projector_type: Optional[str] = field(default='linear')
     mm_use_im_start_end: bool = field(default=False)
     mm_use_im_patch_token: bool = field(default=True)
+    mm_patch_merge_type: Optional[str] = field(default='flat')
     mm_vision_select_feature: Optional[str] = field(default="patch")
 
 
@@ -501,6 +505,10 @@ def preprocess_v1(
                 round_len = len(tokenizer(rou).input_ids)
                 instruction_len = len(tokenizer(parts[0]).input_ids) - 2
 
+            if i != 0 and not tokenizer.legacy and IS_TOKENIZER_GREATER_THAN_0_14:
+                round_len -= 1
+                instruction_len -= 1
+
             target[cur_len : cur_len + instruction_len] = IGNORE_INDEX
 
             cur_len += round_len
@@ -523,6 +531,7 @@ def preprocess_v1(
 def preprocess_mpt(
     sources,
     tokenizer: transformers.PreTrainedTokenizer,
+    has_image: bool = False
 ) -> Dict:
     conv = conversation_lib.default_conversation.copy()
     roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
@@ -542,7 +551,18 @@ def preprocess_mpt(
         conversations.append(conv.get_prompt())
 
     # Tokenize conversations
-    input_ids = torch.stack([tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations], dim=0)
+
+    if has_image:
+        input_ids = torch.stack([tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations], dim=0)
+    else:
+        input_ids = tokenizer(
+            conversations,
+            return_tensors="pt",
+            padding="longest",
+            max_length=tokenizer.model_max_length,
+            truncation=True,
+        ).input_ids
+
     targets = input_ids.clone()
     assert conv.sep_style == conversation_lib.SeparatorStyle.MPT
 
@@ -565,8 +585,18 @@ def preprocess_mpt(
             if len(parts) != 2:
                 break
             parts[0] += sep
-            round_len = len(tokenizer_image_token(rou, tokenizer)) + len(tokenizer_image_token(conv.sep, tokenizer))
-            instruction_len = len(tokenizer_image_token(parts[0], tokenizer))
+
+            if has_image:
+                round_len = len(tokenizer_image_token(rou, tokenizer))
+                instruction_len = len(tokenizer_image_token(parts[0], tokenizer)) - 1
+            else:
+                round_len = len(tokenizer(rou).input_ids)
+                instruction_len = len(tokenizer(parts[0]).input_ids) - 1
+
+            if i != 0 and getattr(tokenizer, 'legacy', False) and IS_TOKENIZER_GREATER_THAN_0_14:
+                round_len += 1
+                instruction_len += 1
+
             target[cur_len : cur_len + instruction_len] = IGNORE_INDEX
 
             cur_len += round_len
@@ -627,7 +657,7 @@ def preprocess(
     if conversation_lib.default_conversation.version.startswith("v1"):
         return preprocess_v1(sources, tokenizer, has_image=has_image)
     if conversation_lib.default_conversation.version == "mpt":
-        return preprocess_mpt(sources, tokenizer)
+        return preprocess_mpt(sources, tokenizer, has_image=has_image)
     # add end signal and concatenate together
     conversations = []
     for source in sources:
@@ -808,7 +838,7 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
                 data_collator=data_collator)
 
 
-def train():
+def train(attn_implementation=None):
     global local_rank
 
     parser = transformers.HfArgumentParser(
@@ -840,7 +870,7 @@ def train():
         if 'mpt' in model_args.model_name_or_path:
             config = transformers.AutoConfig.from_pretrained(model_args.model_name_or_path, trust_remote_code=True)
             config.attn_config['attn_impl'] = training_args.mpt_attn_impl
-            model = LlavaMPTForCausalLM.from_pretrained(
+            model = LlavaMptForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
                 config=config,
                 cache_dir=training_args.cache_dir,
@@ -850,12 +880,16 @@ def train():
             model = LlavaLlamaForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
                 cache_dir=training_args.cache_dir,
+                attn_implementation=attn_implementation,
+                torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
                 **bnb_model_from_pretrained_args
             )
     else:
         model = transformers.LlamaForCausalLM.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=training_args.cache_dir,
+            attn_implementation=attn_implementation,
+            torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
             **bnb_model_from_pretrained_args
         )
     model.config.use_cache = False
