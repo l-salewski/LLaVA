@@ -23,7 +23,7 @@ from src.LLaVA.llava.model.multimodal_projector.builder import build_vision_proj
 
 from src.LLaVA.llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
-from llava.mm_utils import get_anyres_image_grid_shape
+from src.LLaVA.llava.mm_utils import get_anyres_image_grid_shape
 
 
 class LlavaMetaModel:
