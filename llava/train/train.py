@@ -25,6 +25,7 @@ from typing import Dict, Optional, Sequence, List
 import torch
 
 import transformers
+import tokenizers
 
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 from torch.utils.data import Dataset
@@ -33,6 +34,10 @@ from llava.train.llava_trainer import LLaVATrainer
 from llava import conversation as conversation_lib
 from llava.model import *
 from llava.mm_utils import tokenizer_image_token
+
+from src.data.components.clevr import CLEVR
+from src.data.components.image_reference_game import ImageReferenceGameDataset
+from src.models.components.deterministic_model import DeterministicModel
 
 from PIL import Image
 
@@ -43,6 +48,37 @@ local_rank = None
 def rank0_print(*args):
     if local_rank == 0:
         print(*args)
+
+from packaging import version
+IS_TOKENIZER_GREATER_THAN_0_14 = version.parse(tokenizers.__version__) >= version.parse('0.14')
+
+# TODO: remove duplicate code and refactor into utils
+def concatenate_images_bar(
+    img1: Image.Image, img2: Image.Image, bar_width: int = 50
+) -> Image.Image:
+    # Get the sizes of the images
+    width1, height1 = img1.size
+    width2, height2 = img2.size
+
+    # Calculate the new height for both images to maintain aspect ratio
+    new_height = max(height1, height2)
+    new_width1 = int((width1 * new_height) / height1)
+    new_width2 = int((width2 * new_height) / height2)
+
+    # Resize the images
+    img1 = img1.resize((new_width1, new_height), Image.BICUBIC)
+    img2 = img2.resize((new_width2, new_height), Image.BICUBIC)
+
+    # Create a white bar
+    white_bar = Image.new("RGB", (bar_width, new_height), (255, 255, 255))
+
+    # Concatenate the images with the white bar
+    result = Image.new("RGB", (new_width1 + 50 + new_width2, new_height))
+    result.paste(img1, (0, 0))
+    result.paste(white_bar, (new_width1, 0))
+    result.paste(img2, (new_width1 + 50, 0))
+
+    return result
 
 
 @dataclass
@@ -57,6 +93,7 @@ class ModelArguments:
     mm_projector_type: Optional[str] = field(default='linear')
     mm_use_im_start_end: bool = field(default=False)
     mm_use_im_patch_token: bool = field(default=True)
+    mm_patch_merge_type: Optional[str] = field(default='flat')
     mm_vision_select_feature: Optional[str] = field(default="patch")
 
 
@@ -468,6 +505,10 @@ def preprocess_v1(
                 round_len = len(tokenizer(rou).input_ids)
                 instruction_len = len(tokenizer(parts[0]).input_ids) - 2
 
+            if i != 0 and not tokenizer.legacy and IS_TOKENIZER_GREATER_THAN_0_14:
+                round_len -= 1
+                instruction_len -= 1
+
             target[cur_len : cur_len + instruction_len] = IGNORE_INDEX
 
             cur_len += round_len
@@ -490,6 +531,7 @@ def preprocess_v1(
 def preprocess_mpt(
     sources,
     tokenizer: transformers.PreTrainedTokenizer,
+    has_image: bool = False
 ) -> Dict:
     conv = conversation_lib.default_conversation.copy()
     roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
@@ -509,7 +551,18 @@ def preprocess_mpt(
         conversations.append(conv.get_prompt())
 
     # Tokenize conversations
-    input_ids = torch.stack([tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations], dim=0)
+
+    if has_image:
+        input_ids = torch.stack([tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations], dim=0)
+    else:
+        input_ids = tokenizer(
+            conversations,
+            return_tensors="pt",
+            padding="longest",
+            max_length=tokenizer.model_max_length,
+            truncation=True,
+        ).input_ids
+
     targets = input_ids.clone()
     assert conv.sep_style == conversation_lib.SeparatorStyle.MPT
 
@@ -532,8 +585,18 @@ def preprocess_mpt(
             if len(parts) != 2:
                 break
             parts[0] += sep
-            round_len = len(tokenizer_image_token(rou, tokenizer)) + len(tokenizer_image_token(conv.sep, tokenizer))
-            instruction_len = len(tokenizer_image_token(parts[0], tokenizer))
+
+            if has_image:
+                round_len = len(tokenizer_image_token(rou, tokenizer))
+                instruction_len = len(tokenizer_image_token(parts[0], tokenizer)) - 1
+            else:
+                round_len = len(tokenizer(rou).input_ids)
+                instruction_len = len(tokenizer(parts[0]).input_ids) - 1
+
+            if i != 0 and getattr(tokenizer, 'legacy', False) and IS_TOKENIZER_GREATER_THAN_0_14:
+                round_len += 1
+                instruction_len += 1
+
             target[cur_len : cur_len + instruction_len] = IGNORE_INDEX
 
             cur_len += round_len
@@ -594,7 +657,7 @@ def preprocess(
     if conversation_lib.default_conversation.version.startswith("v1"):
         return preprocess_v1(sources, tokenizer, has_image=has_image)
     if conversation_lib.default_conversation.version == "mpt":
-        return preprocess_mpt(sources, tokenizer)
+        return preprocess_mpt(sources, tokenizer, has_image=has_image)
     # add end signal and concatenate together
     conversations = []
     for source in sources:
@@ -630,43 +693,65 @@ class LazySupervisedDataset(Dataset):
                  tokenizer: transformers.PreTrainedTokenizer,
                  data_args: DataArguments):
         super(LazySupervisedDataset, self).__init__()
-        list_data_dict = json.load(open(data_path, "r"))
+
+        deterministic_model = DeterministicModel(
+            output_template="The image contains {raw_output}.",
+            attributes=["color", "shape", "material", "size"],
+            contrastive=True,
+            num_sampled_objects=[1,3],
+            num_sampled_attributes=[1,3],
+        )
+
+        dataset = CLEVR(split="train")
+        self.dataset = ImageReferenceGameDataset(dataset, True, deterministic_model=deterministic_model)
 
         rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
-        self.list_data_dict = list_data_dict
         self.data_args = data_args
 
     def __len__(self):
-        return len(self.list_data_dict)
+        return len(self.dataset)
 
     @property
     def lengths(self):
-        length_list = []
-        for sample in self.list_data_dict:
-            img_tokens = 128 if 'image' in sample else 0
-            length_list.append(sum(len(conv['value'].split()) for conv in sample['conversations']) + img_tokens)
+        # approximation because we don't have fixed lengths
+        length_list = [128+64] * len(self)
         return length_list
 
     @property
     def modality_lengths(self):
-        length_list = []
-        for sample in self.list_data_dict:
-            cur_len = sum(len(conv['value'].split()) for conv in sample['conversations'])
-            cur_len = cur_len if 'images' in sample else -cur_len
-            length_list.append(cur_len)
+        # approximation because we don't have fixed lengths
+        length_list = [64] * len(self)
         return length_list
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
-        sources = self.list_data_dict[i]
+        data = self.dataset[i]
+
+        correct_class = 'left' if data['correct_class'] == 'A' else 'right'
+        incorrect_class = 'right' if data['correct_class'] == 'A' else 'left'
+
+        sources_orig = {
+            'id': data['index'],
+            'image': data['path'],
+            'conversations': [
+                {'from': 'human', 'value': f"<image>\nWrite a description for the {correct_class} image, such that it can be differentiated from the {incorrect_class} image, but do not talk about the {incorrect_class} image. Do not name which image you are describing."},
+                {'from': 'gpt', 'value': data['deterministic_caption']}
+            ]
+        }
+
+        sources = sources_orig
+
+        image = concatenate_images_bar(*data['few_shot_images']).convert('RGB')
+
+        #llava: "Write a description for the {correct_class} image, such that it can be differentiated from the {incorrect_class} image, but do not talk about the {incorrect_class} image. Do not name which image you are describing. Left image: {few_shot_image_0}. Right image: {few_shot_image_1}."
         if isinstance(i, int):
             sources = [sources]
         assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
         if 'image' in sources[0]:
-            image_file = self.list_data_dict[i]['image']
-            image_folder = self.data_args.image_folder
+            #image_file = sources[0]['image']
+            #image_folder = self.data_args.image_folder
             processor = self.data_args.image_processor
-            image = Image.open(os.path.join(image_folder, image_file)).convert('RGB')
+            #image = Image.open(os.path.join(image_folder, image_file)).convert('RGB')
             if self.data_args.image_aspect_ratio == 'pad':
                 def expand2square(pil_img, background_color):
                     width, height = pil_img.size
@@ -692,18 +777,18 @@ class LazySupervisedDataset(Dataset):
         data_dict = preprocess(
             sources,
             self.tokenizer,
-            has_image=('image' in self.list_data_dict[i]))
+            has_image=('image' in sources_orig))
         if isinstance(i, int):
             data_dict = dict(input_ids=data_dict["input_ids"][0],
                              labels=data_dict["labels"][0])
 
         # image exist in the data
-        if 'image' in self.list_data_dict[i]:
+        if 'image' in sources_orig:
             data_dict['images'] = image
         elif self.data_args.is_multimodal:
             # image does not exist in the data, but the model is multimodal
             crop_size = self.data_args.image_processor.crop_size
-            data_dict['images'] = torch.zeros(3, crop_size['height'], crop_size['width'])
+            data_dict['image'] = torch.zeros(3, crop_size['height'], crop_size['width'])
         return data_dict
 
 
@@ -731,8 +816,8 @@ class DataCollatorForSupervisedDataset(object):
             attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
         )
 
-        if 'images' in instances[0]:
-            images = [instance['images'] for instance in instances]
+        if 'image' in instances[0]:
+            images = [instance['image'] for instance in instances]
             if all(x is not None and x.shape == images[0].shape for x in images):
                 batch['images'] = torch.stack(images)
             else:
@@ -753,7 +838,7 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
                 data_collator=data_collator)
 
 
-def train():
+def train(attn_implementation=None):
     global local_rank
 
     parser = transformers.HfArgumentParser(
@@ -785,7 +870,7 @@ def train():
         if 'mpt' in model_args.model_name_or_path:
             config = transformers.AutoConfig.from_pretrained(model_args.model_name_or_path, trust_remote_code=True)
             config.attn_config['attn_impl'] = training_args.mpt_attn_impl
-            model = LlavaMPTForCausalLM.from_pretrained(
+            model = LlavaMptForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
                 config=config,
                 cache_dir=training_args.cache_dir,
@@ -795,12 +880,16 @@ def train():
             model = LlavaLlamaForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
                 cache_dir=training_args.cache_dir,
+                attn_implementation=attn_implementation,
+                torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
                 **bnb_model_from_pretrained_args
             )
     else:
         model = transformers.LlamaForCausalLM.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=training_args.cache_dir,
+            attn_implementation=attn_implementation,
+            torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
             **bnb_model_from_pretrained_args
         )
     model.config.use_cache = False
@@ -876,7 +965,7 @@ def train():
             model_args=model_args,
             fsdp=training_args.fsdp
         )
-        
+
         vision_tower = model.get_vision_tower()
         vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
 
