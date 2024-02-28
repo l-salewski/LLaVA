@@ -33,7 +33,7 @@ from llava.train.llava_trainer import LLaVATrainer
 
 from llava import conversation as conversation_lib
 from llava.model import *
-from llava.mm_utils import tokenizer_image_token
+from llava.mm_utils import tokenizer_image_token, process_images
 
 from src.data.components.clevr import CLEVR
 from src.data.components.image_reference_game import ImageReferenceGameDataset
@@ -702,7 +702,11 @@ class LazySupervisedDataset(Dataset):
             num_sampled_attributes=[1,3],
         )
 
-        dataset = CLEVR(split="train")
+        possible_resolutions = [(2,2), (1,2), (2,1), (1,3), (3,1), (1,4), (4,1)]
+        possible_resolutions = [(x * 336, y * 336) for x,y in possible_resolutions]
+        data_args.image_grid_pinpoints = possible_resolutions
+
+        dataset = CLEVR(split="train", root="/mnt/local/data/CLEVR_v1.0", max_objects=3)
         self.dataset = ImageReferenceGameDataset(dataset, True, deterministic_model=deterministic_model)
 
         rank0_print("Formatting inputs...Skip in lazy mode")
@@ -727,8 +731,8 @@ class LazySupervisedDataset(Dataset):
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
         data = self.dataset[i]
 
-        correct_class = 'left' if data['correct_class'] == 'A' else 'right'
-        incorrect_class = 'right' if data['correct_class'] == 'A' else 'left'
+        correct_class = 'left' if data['correct_class'] in ['A', 'left'] else 'right'
+        incorrect_class = 'right' if data['correct_class'] in ['A', 'left'] else 'left'
 
         sources_orig = {
             'id': data['index'],
@@ -738,10 +742,10 @@ class LazySupervisedDataset(Dataset):
                 {'from': 'gpt', 'value': data['deterministic_caption']}
             ]
         }
-
         sources = sources_orig
 
         image = concatenate_images_bar(*data['few_shot_images']).convert('RGB')
+        image_size = image.size
 
         #llava: "Write a description for the {correct_class} image, such that it can be differentiated from the {incorrect_class} image, but do not talk about the {incorrect_class} image. Do not name which image you are describing. Left image: {few_shot_image_0}. Right image: {few_shot_image_1}."
         if isinstance(i, int):
@@ -768,7 +772,7 @@ class LazySupervisedDataset(Dataset):
                 image = expand2square(image, tuple(int(x*255) for x in processor.image_mean))
                 image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
             else:
-                image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+                image = process_images([image], processor, self.data_args)[0]
             sources = preprocess_multimodal(
                 copy.deepcopy([e["conversations"] for e in sources]),
                 self.data_args)
@@ -784,7 +788,8 @@ class LazySupervisedDataset(Dataset):
 
         # image exist in the data
         if 'image' in sources_orig:
-            data_dict['images'] = image
+            data_dict['image'] = image
+            data_dict['image_size'] = image_size
         elif self.data_args.is_multimodal:
             # image does not exist in the data, but the model is multimodal
             crop_size = self.data_args.image_processor.crop_size
@@ -822,6 +827,7 @@ class DataCollatorForSupervisedDataset(object):
                 batch['images'] = torch.stack(images)
             else:
                 batch['images'] = images
+            batch['image_sizes'] = [i['image_size'] for i in instances]
 
         return batch
 
