@@ -706,7 +706,7 @@ class LazySupervisedDataset(Dataset):
         possible_resolutions = [(x * 336, y * 336) for x,y in possible_resolutions]
         data_args.image_grid_pinpoints = possible_resolutions
 
-        dataset = CLEVR(split="train", root="/mnt/local/data/CLEVR_v1.0", max_objects=3)
+        dataset = CLEVR(split="train", root=data_args.data_path, max_objects=3)
         self.dataset = ImageReferenceGameDataset(dataset, True, deterministic_model=deterministic_model)
 
         rank0_print("Formatting inputs...Skip in lazy mode")

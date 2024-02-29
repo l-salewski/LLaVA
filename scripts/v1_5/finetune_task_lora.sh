@@ -5,12 +5,12 @@
 #    --model_name_or_path liuhaotian/llava-v1.6-vicuna-7b \
 #    --image_aspect_ratio pad \
 #    --image_aspect_ratio anyres \
-deepspeed --include=localhost:1 llava/train/train_mem.py \
+deepspeed llava/train/train_mem.py \
     --lora_enable True --lora_r 128 --lora_alpha 256 --mm_projector_lr 2e-5 \
     --deepspeed ./scripts/zero3.json \
     --model_name_or_path liuhaotian/llava-v1.6-vicuna-7b \
     --version v1 \
-    --data_path ./playground/data/detail_23k.json \
+    --data_path /shared-network/CLEVR_v1.0 \
     --image_folder ./playground/data \
     --vision_tower openai/clip-vit-large-patch14-336 \
     --mm_projector_type mlp2x_gelu \
