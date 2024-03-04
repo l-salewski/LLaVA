@@ -14,33 +14,34 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
-import os
 import copy
-from dataclasses import dataclass, field
 import json
 import logging
+import os
 import pathlib
-from typing import Dict, Optional, Sequence, List
+from dataclasses import dataclass, field
+from functools import partial
+from typing import Dict, List, Optional, Sequence
 
-import torch
-
-import transformers
 import tokenizers
-
-from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
-from torch.utils.data import Dataset
-from llava.train.llava_trainer import LLaVATrainer
-
-from llava import conversation as conversation_lib
-from llava.model import *
-from llava.mm_utils import tokenizer_image_token, process_images
-
+import torch
+import transformers
+from PIL import Image
 from src.data.components.clevr import CLEVR
 from src.data.components.image_reference_game import ImageReferenceGameDataset
+from src.LLaVA.llava import conversation as conversation_lib
+from src.LLaVA.llava.constants import (
+    DEFAULT_IM_END_TOKEN,
+    DEFAULT_IM_START_TOKEN,
+    DEFAULT_IMAGE_TOKEN,
+    IGNORE_INDEX,
+    IMAGE_TOKEN_INDEX,
+)
+from src.LLaVA.llava.mm_utils import process_images, tokenizer_image_token
+from src.LLaVA.llava.model import *
+from src.LLaVA.llava.train.llava_trainer import LLaVATrainer
 from src.models.components.deterministic_model import DeterministicModel
-
-from PIL import Image
-
+from torch.utils.data import Dataset
 
 local_rank = None
 
@@ -50,6 +51,7 @@ def rank0_print(*args):
         print(*args)
 
 from packaging import version
+
 IS_TOKENIZER_GREATER_THAN_0_14 = version.parse(tokenizers.__version__) >= version.parse('0.14')
 
 # TODO: remove duplicate code and refactor into utils
@@ -158,7 +160,7 @@ def maybe_zero_3(param, ignore_status=False, name=None):
 
 
 # Borrowed from peft.utils.get_peft_model_state_dict
-def get_peft_state_maybe_zero_3(named_params, bias):
+def get_peft_state_maybe_zero_3(named_params, bias, check_deepspeed=True):
     if bias == "none":
         to_return = {k: t for k, t in named_params if "lora_" in k}
     elif bias == "all":
@@ -179,7 +181,10 @@ def get_peft_state_maybe_zero_3(named_params, bias):
                 to_return[bias_name] = t
     else:
         raise NotImplementedError
-    to_return = {k: maybe_zero_3(v, ignore_status=True) for k, v in to_return.items()}
+    if check_deepspeed:
+        to_return = {k: maybe_zero_3(v, ignore_status=True) for k, v in to_return.items()}
+    else:
+        to_return = {k: v.detach().cpu().clone() for k, v in to_return.items()}
     return to_return
 
 
@@ -706,7 +711,7 @@ class LazySupervisedDataset(Dataset):
         possible_resolutions = [(x * 336, y * 336) for x,y in possible_resolutions]
         data_args.image_grid_pinpoints = possible_resolutions
 
-        dataset = CLEVR(split="train", root="/mnt/local/data/CLEVR_v1.0", max_objects=3)
+        dataset = partial(CLEVR, train=True, root="/mnt/local/data/CLEVR_v1.0", max_objects=3)
         self.dataset = ImageReferenceGameDataset(dataset, True, deterministic_model=deterministic_model)
 
         rank0_print("Formatting inputs...Skip in lazy mode")
